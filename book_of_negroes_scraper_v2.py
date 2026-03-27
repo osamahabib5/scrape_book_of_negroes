@@ -10,122 +10,100 @@ OUTPUT_FILE = "Black_Loyalist_Directory_Consolidated.xlsx"
 
 # ── Cleaning Helpers ──────────────────────────────────────────────────────────
 def _clean_name(val):
-    """Removes brackets, extra spaces, and trailing punctuation from names."""
     if not isinstance(val, str): return ""
     val = re.sub(r"[\[\]\{\}\(\)]", "", val)
     return re.sub(r"\s+", " ", val).strip().strip(",.;")
 
 def clean_val(val):
-    """Clean specific noise words and whitespace from strings."""
-    if not isinstance(val, str) or val in ["-", "N/A", "", "None"]: return "-"
+    if not isinstance(val, str) or val in ["-", "N/A", "", "None", "nan"]: return "-"
     val = re.split(r"[\(\)]|Born\s+free|belonging", val, flags=re.I)[0]
     val = re.sub(r"\s+", " ", val).strip().rstrip(",.;")
     return val if val else "-"
 
-# ── Extraction Logic ──────────────────────────────────────────────────────────
+# ── Logic: Race, Ethnicity, Description ──────────────────────────────────────
+def extract_race_details(line):
+    line_l = line.lower()
+    race, ethnicity, description = "Black", "African American", "Black"
+    
+    # Keywords for Mixed Race
+    mixed_keywords = ["mulatto", "indian", "span.", "spanish", "half indian", "between"]
+    
+    if any(k in line_l for k in mixed_keywords):
+        ethnicity = "Mixed Race"
+        if "mulatto" in line_l:
+            description = "Mulatto"
+            race = "Mulatto"
+        if "indian" in line_l and "span" in line_l:
+            race = "Indian/Spanish"
+            description = "Mulatto"
+        elif "half indian" in line_l:
+            race = "Half Indian"
+            description = "Mulatto"
+    
+    return race, ethnicity, description
+
+# ── Logic: Geography Extraction ──────────────────────────────────────────────
+def extract_geo_from_text(line):
+    # Common 18th Century States/Colonies
+    states = ["Virginia", "Maryland", "New Jersey", "New York", "Georgia", "South Carolina", "North Carolina", "Pennsylvania"]
+    found_state = "-"
+    found_port = "-"
+
+    for state in states:
+        if state in line:
+            found_state = state
+            # Try to grab the word before the state as the port/county
+            match = re.search(r"([^,.;]+)\s*,\s*" + re.escape(state), line)
+            if match:
+                found_port = match.group(1).strip()
+            break
+            
+    if found_port == "-" and "Jamaica South" in line:
+        found_port = "Jamaica South"
+
+    return found_port, found_state
+
+# ── Logic: Advanced Gender ──────────────────────────────────────────────────
+def determine_gender(line, age_val):
+    line_l = line.lower()
+    is_child = False
+    
+    # Determine if child by age
+    if isinstance(age_val, (int, float)) and age_val < 18:
+        is_child = True
+    # Determine if child by keywords
+    elif any(k in line_l for k in ["boy", "girl", "child"]):
+        is_child = True
+        
+    if any(k in line_l for k in ["woman", "wench", "girl", "negress"]):
+        return "Child Female" if is_child else "Female"
+    else:
+        return "Child Male" if is_child else "Male"
+
+# ── Extraction Logic: Headers ────────────────────────────────────────────────
 def extract_header_info(line):
-    """
-    Extracts Ship Name, City, and Commander.
-    Logic: If line starts with Ship/Sloop/etc, Ship Name is text between keyword and 'bound'.
-    If not, Ship Name is all text before 'bound'.
-    """
     if "bound for" in line.lower():
-        # Split into [Prefix/Ship Name] and [Destination + Commander]
         parts = re.split(r"\s+bound\s+for\s+", line, flags=re.I)
         ship_part = parts[0].strip()
         rest = parts[1].strip()
         
-        # Rule: Handle prefixes vs. no prefixes for Ship Name
         prefix_pattern = r"^(Ship|Brig|Sloop|Schooner|Brigantine|Snow)\s+(.*)$"
         m_prefix = re.match(prefix_pattern, ship_part, re.I)
-        if m_prefix:
-            ship_name = m_prefix.group(2).strip()
-        else:
-            ship_name = ship_part
+        ship_name = m_prefix.group(2).strip() if m_prefix else ship_part
             
-        # Refined City and Commander isolation
-        # List sorted by length descending to match full city names first
-        cities = [
-            "River St. John's", "St. John's River", "St. John's", 
-            "Port Roseway", "Halifax", "Annapolis Royal", 
-            "Spithead & Germany", "Shelburne", "River St. Johns"
-        ]
-        
+        cities = ["River St. John's", "St. John's River", "St. John's", "Port Roseway", "Halifax", "Annapolis Royal", "Shelburne"]
         found_city, commander = "-", "-"
         for city in sorted(cities, key=len, reverse=True):
             if re.search(re.escape(city), rest, re.I):
                 found_city = city
-                # The text following the city is usually the commander
                 cmd_raw = re.split(re.escape(city), rest, flags=re.I)[-1].strip()
-                if cmd_raw:
-                    # Strip ", Master" suffix if present
-                    cmd_raw = re.sub(r",?\s*Master$", "", cmd_raw, flags=re.I).strip()
-                    commander = cmd_raw
+                commander = re.sub(r",?\s*Master$", "", cmd_raw, flags=re.I).strip() if cmd_raw else "-"
                 break
         
-        if found_city == "-": found_city = rest # Fallback to raw rest if no city matches
-
-        return {
-            "ship": clean_val(ship_name), 
-            "city": found_city, 
-            "cmd": clean_val(commander)
-        }
-    
-    # Check for "On Board the Ship... Master" pattern without "bound for"
-    m_master = re.search(r"(?:On\s+Board\s+the\s+)?(?:Ship|Brig|Sloop|Schooner)\s+(.*?)\s+([A-Z][A-Za-z\.]+(?:\s+[A-Z][A-Za-z\.]+)*),\s+Master", line, re.I)
-    if m_master:
-        return {"ship": clean_val(m_master.group(1)), "cmd": clean_val(m_master.group(2)), "city": "-"}
-
+        return {"ship": clean_val(ship_name), "city": found_city, "cmd": clean_val(commander)}
     return None
 
-def extract_enslaver(line):
-    """
-    Extracts the enslaver name from the record line.
-    """
-    # 1. Parentheses check (ignoring noise like "born free" or physical descriptions)
-    pm = re.search(r"\(([^)]+)\)", line)
-    if pm:
-        raw = pm.group(1).strip()
-        noise = r"born\s+free|own\s+bottom|claims\s+to\s+be|aged|years|wench|fellow|stout|healthy"
-        if not re.search(noise, raw, re.I):
-            return _clean_name(raw)
-    
-    # 2. Key phrase check (Property of, Slave to, etc.)
-    sm = re.search(r"(?:property\s+of|slave\s+to|lived\s+with)\s+([A-Z][A-Za-z\.]+(?:\s+[A-Z][A-Za-z\.]+)*)", line, re.I)
-    if sm:
-        return _clean_name(sm.group(1))
-        
-    return "-"
-
-# ── Reference Loader ──────────────────────────────────────────────────────────
-def load_reference(path):
-    if not os.path.exists(path): 
-        print(f"Warning: {path} not found.")
-        return []
-    try:
-        df = pd.read_excel(path, dtype=str).fillna("")
-        df.columns = [c.strip() for c in df.columns]
-        lookup_list = []
-        for _, row in df.iterrows():
-            lookup_list.append({
-                "ship_norm": clean_val(row.get("Ship_Name", row.get("Ship", ""))).lower(),
-                "name_norm": _clean_name(row.get("Name", "")).lower(),
-                "Ref_Page": row.get("Ref Page", row.get("Ref_Page", row.get("Page", "-"))),
-                "Primary_Source_2": row.get("Primary_Source 2", "-")
-            })
-        return lookup_list
-    except Exception as e:
-        print(f"Error loading Excel: {e}"); return []
-
-def lookup_excel(ref_list, ship_name, first_name, surname):
-    s_norm = clean_val(ship_name).lower()
-    full_n_norm = _clean_name(f"{first_name} {surname}").lower()
-    for item in ref_list:
-        if item["ship_norm"] == s_norm and item["name_norm"] == full_n_norm:
-            return item
-    return None
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main Process ─────────────────────────────────────────────────────────────
 def process_word_docs():
     files = [
         ("Book One Part One", "Book_One_Part_One_of_the_Book_of_Negroes.docx"),
@@ -134,68 +112,109 @@ def process_word_docs():
         ("Book Three", "Book_Three.docx")
     ]
 
-    ref_list = load_reference(REFERENCE_EXCEL)
-    all_records, global_id = [], 1
+    # Load Excel Reference
+    print("Loading Reference Excel...")
+    try:
+        df_ref = pd.read_excel(REFERENCE_EXCEL, dtype=str).fillna("-")
+        df_ref.columns = [c.strip() for c in df_ref.columns]
+    except:
+        df_ref = pd.DataFrame()
 
-    # Persist ship info across lines and documents
+    all_records, global_id = [], 1
     current_ship, current_commander, current_city = "-", "-", "-"
     
+    # Family Context Memory
+    last_male_first, last_male_sur = "-", "-"
+    last_female_first, last_female_sur = "-", "-"
+
     for book_label, filename in files:
         file_path = os.path.join(FOLDER_PATH, filename)
         if not os.path.exists(file_path): continue
-            
         doc = Document(file_path)
-        print(f"Processing {book_label}...")
-
+        
         for para in doc.paragraphs:
             line = para.text.strip()
             if not line: continue
             
-            # --- Header Detection ---
-            is_ship_line = any(kw in line.lower() for kw in ["bound for", "boarding", "on board", "master"])
-            if is_ship_line and not re.search(r"^\d+", line):
+            # Header Detection
+            if any(kw in line.lower() for kw in ["bound for", "master"]) and not re.search(r"^\d+", line):
                 header = extract_header_info(line)
                 if header:
-                    current_ship = header["ship"]
-                    current_commander = header["cmd"]
-                    current_city = header["city"]
+                    current_ship, current_commander, current_city = header["ship"], header["cmd"], header["city"]
                 continue
 
-            # --- Individual Record Detection ---
-            if "," in line and re.search(r"\d+", line) and not line.startswith(("[", "In pursuance", "Inspected")):
+            # Individual Record Detection
+            if "," in line and re.search(r"\d+", line) and not line.startswith(("[", "In pursuance")):
                 raw_name_part = line.split(",")[0].strip()
                 name_parts = raw_name_part.split(None, 1)
+                f_name = name_parts[0] if name_parts else "-"
+                s_name = name_parts[1] if len(name_parts) > 1 else "-"
                 
-                first_name = name_parts[0] if name_parts else "-"
-                surname = name_parts[1] if len(name_parts) > 1 else "-"
-                
-                age_m = re.search(r"(?:aged\s+)?(\d{1,3})", line, re.I)
-                age_val = int(age_m.group(1)) if age_m else "-"
-                gender = "Female" if any(w in line.lower() for w in ["woman", "wench", "girl"]) else "Male"
-                
-                xl_match = lookup_excel(ref_list, current_ship, first_name, surname)
+                age_match = re.search(r"(\d{1,3}(?:\s?½)?)", line)
+                age_str = age_match.group(1) if age_match else "-"
+                try: age_val = float(age_str.replace("½", ".5"))
+                except: age_val = 0
 
+                # 1. Race/Ethnicity/Description
+                race, ethnicity, desc = extract_race_details(line)
+
+                # 2. Gender Logic
+                gender_cat = determine_gender(line, age_val)
+
+                # 3. Family Logic (Scenario 1, 2, 3)
+                f_father, s_father, f_mother, s_mother = "-", "-", "-", "-"
+                if "daughter" in line.lower() or "son" in line.lower() or "child" in line.lower():
+                    if "their" in line.lower() or ("his" in line.lower() and "wife" in globals().get('last_line','')):
+                        f_father, s_father = last_male_first, last_male_sur
+                        f_mother, s_mother = last_female_first, last_female_sur
+                    elif "her" in line.lower():
+                        f_mother, s_mother = last_female_first, last_female_sur
+                    elif "his" in line.lower():
+                        f_father, s_father = last_male_first, last_male_sur
+
+                # Update Family Memory for next lines
+                if "Male" in gender_cat and "Child" not in gender_cat:
+                    last_male_first, last_male_sur = f_name, s_name
+                elif "Female" in gender_cat and "Child" not in gender_cat:
+                    last_female_first, last_female_sur = f_name, s_name
+
+                # 4. Excel Lookup (Origination, Source, etc)
+                xl_row = df_ref[(df_ref['Ship_Name'] == current_ship) & (df_ref['Name'].str.contains(f_name, na=False))].head(1)
+                
+                # Geography Fallback
+                word_port, word_state = extract_geo_from_text(line)
+                
                 all_records.append({
-                    "ID": global_id, 
-                    "Ref_Page": xl_match["Ref_Page"] if xl_match else "-",
-                    "Book": book_label, 
-                    "Ship_Name": current_ship, 
+                    "ID": global_id,
+                    "Ref_Page": xl_row['Ref Page'].values[0] if not xl_row.empty else "-",
+                    "Book": book_label,
+                    "Ship_Name": current_ship,
                     "Commander": current_commander,
-                    "Enslaver": extract_enslaver(line), 
-                    "First_Name": _clean_name(first_name), 
-                    "Surname": _clean_name(surname),
-                    "Gender": gender, 
-                    "Age": age_val, 
+                    "First_Name": _clean_name(f_name),
+                    "Surname": _clean_name(s_name),
+                    "Father_FirstName": f_father,
+                    "Father_Surname": s_father,
+                    "Mother_FirstName": f_mother,
+                    "Mother_Surname": s_mother,
+                    "Gender": gender_cat,
+                    "Age": age_str,
+                    "Race": race,
+                    "Ethnicity": ethnicity,
+                    "Description": desc,
+                    "Origination_Port": xl_row['Origination Port'].values[0] if not xl_row.empty and xl_row['Origination Port'].values[0] != "-" else word_port,
+                    "Origination_State": word_state,
+                    # "Country": xl_row['Country'].values[0] if not xl_row.empty else "-",
+                    "Departure_Port": xl_row['Departure_Port'].values[0] if not xl_row.empty else "-",
+                    "Departure_Date": xl_row['Departure_Date'].values[0] if not xl_row.empty else "-",
                     "Arrival_Port_City": current_city,
-                    "Notes": line,
-                    "Primary_Source_2": xl_match["Primary_Source_2"] if xl_match else "-"
+                    "Primary_Source_1": xl_row['Primary_Source 1'].values[0] if not xl_row.empty else "-",
+                    "Primary_Source_2": xl_row['Primary_Source 2'].values[0] if not xl_row.empty else "-",
+                    "Notes": line
                 })
                 global_id += 1
 
-    df = pd.DataFrame(all_records)
-    df = df.fillna("-").replace(["", "nan", "None"], "-")
-    df.to_excel(OUTPUT_FILE, index=False)
-    print(f"SUCCESS: {len(df)} records generated.")
+    pd.DataFrame(all_records).to_excel(OUTPUT_FILE, index=False)
+    print(f"Done. {len(all_records)} records saved.")
 
 if __name__ == "__main__":
     process_word_docs()

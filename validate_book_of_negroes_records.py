@@ -19,30 +19,58 @@ ORDERED_FILES = [
     "Book_Three.docx"
 ]
 
-def extract_ship_name(line):
+def extract_header_info(line):
     """
-    Extracts Ship Name from a line of text.
-    Logic: If line contains 'bound for', Ship Name is text between any vessel 
-    keyword (Ship/Brig/etc.) and 'bound'. If no vessel keyword prefix, 
-    Ship Name is all text before 'bound for'.
-    Returns None if no ship name can be extracted.
+    Extracts Ship Name, City, and Commander from a ship header line.
+    Returns a dict with 'ship', 'city', 'cmd' or None if not a ship line.
     """
     if "bound for" in line.lower():
-        # Split into [Prefix/Ship Name] and [Destination + Commander]
         parts = re.split(r"\s+bound\s+for\s+", line, flags=re.I)
         ship_part = parts[0].strip()
+        rest = parts[1].strip()
 
-        # Rule: Handle prefixes vs. no prefixes for Ship Name
         prefix_pattern = r"^(Ship|Brig|Sloop|Schooner|Brigantine|Snow)\s+(.*)$"
         m_prefix = re.match(prefix_pattern, ship_part, re.I)
-        if m_prefix:
-            ship_name = m_prefix.group(2).strip()
-        else:
-            ship_name = ship_part
+        ship_name = m_prefix.group(2).strip() if m_prefix else ship_part
 
-        return ship_name if ship_name else None
+        cities = [
+            "River St. John's", "St. John's River", "St. John's",
+            "Port Roseway", "Halifax", "Annapolis Royal",
+            "Spithead & Germany", "Shelburne", "River St. Johns"
+        ]
 
-    return None  # No 'bound for' found, not a ship line
+        found_city, commander = "-", "-"
+        for city in sorted(cities, key=len, reverse=True):
+            if re.search(re.escape(city), rest, re.I):
+                found_city = city
+                cmd_raw = re.split(re.escape(city), rest, flags=re.I)[-1].strip()
+                if cmd_raw:
+                    cmd_raw = re.sub(r",?\s*Master$", "", cmd_raw, flags=re.I).strip()
+                    commander = cmd_raw
+                break
+
+        if found_city == "-":
+            found_city = rest
+
+        return {
+            "ship": ship_name if ship_name else None,
+            "city": found_city,
+            "cmd": commander
+        }
+
+    # Check for "On Board the Ship... Master" pattern without "bound for"
+    m_master = re.search(
+        r"(?:On\s+Board\s+the\s+)?(?:Ship|Brig|Sloop|Schooner)\s+(.*?)\s+([A-Z][A-Za-z\.]+(?:\s+[A-Z][A-Za-z\.]+)*),\s+Master",
+        line, re.I
+    )
+    if m_master:
+        return {
+            "ship": m_master.group(1).strip(),
+            "cmd": m_master.group(2).strip(),
+            "city": "-"
+        }
+
+    return None
 
 
 def get_word_content_ordered(directory_path):
@@ -78,17 +106,17 @@ def get_word_content_ordered(directory_path):
     return all_records
 
 
-def find_last_ship_before(index, all_records):
+def find_last_header_before(index, all_records):
     """
     Backtracks from the given index through all_records (across files in order)
-    and returns the last ship name found before this entry.
-    Returns 'Unknown/Not Found' if none is found.
+    and returns the last header info (ship, city, commander) found before this entry.
+    Returns defaults if none found.
     """
     for i in range(index - 1, -1, -1):
-        ship = extract_ship_name(all_records[i]["Notes"])
-        if ship:
-            return ship
-    return "Unknown/Not Found"
+        header = extract_header_info(all_records[i]["Notes"])
+        if header and header["ship"]:
+            return header
+    return {"ship": "Unknown/Not Found", "city": "-", "cmd": "-"}
 
 
 def process_loyallist_comparison(excel_path, word_dir, output_file):
@@ -120,8 +148,9 @@ def process_loyallist_comparison(excel_path, word_dir, output_file):
         source_file = record["Source_Word_File"]
         mapped_book = FILE_TO_BOOK_MAP.get(source_file, "Unknown Book")
 
-        # Try to extract a ship name directly from this entry
-        extracted_ship = extract_ship_name(note_text)
+        # Try to extract header info directly from this entry
+        extracted_header = extract_header_info(note_text)
+        extracted_ship = extracted_header["ship"] if extracted_header else None
 
         # --- Validation Step 1: Check Ship+Book combo ---
         if extracted_ship:
@@ -133,14 +162,19 @@ def process_loyallist_comparison(excel_path, word_dir, output_file):
         if note_text in existing_notes:
             continue  # Already in master, skip
 
-        # --- Entry is missing from master: determine ship name ---
+        # --- Entry is missing from master: determine ship, commander, city ---
         if extracted_ship:
-            # Case 1: Entry itself is a ship line
+            # Case 1: Entry itself is a ship header line
             final_ship = extracted_ship
+            final_commander = extracted_header["cmd"]
+            final_city = extracted_header["city"]
             ship_source = "Extracted from entry"
         else:
-            # Case 2: Not a ship line — backtrack to find the last ship
-            final_ship = find_last_ship_before(idx, all_records)
+            # Case 2: Not a ship line — backtrack to find the last header
+            last_header = find_last_header_before(idx, all_records)
+            final_ship = last_header["ship"]
+            final_commander = last_header["cmd"]
+            final_city = last_header["city"]
             ship_source = "Backtracked from previous entries"
 
         report_key = (note_text, source_file, final_ship)
@@ -149,13 +183,15 @@ def process_loyallist_comparison(excel_path, word_dir, output_file):
                 "Notes": note_text,
                 "Source_Word_File": source_file,
                 "Ship": final_ship,
+                "Commander": final_commander,
+                "Arrival_Port_City": final_city,
                 "Ship_Source": ship_source
             })
             seen_in_report.add(report_key)
 
     if missing_records:
         df_final = pd.DataFrame(missing_records)
-        df_final = df_final[["Notes", "Source_Word_File", "Ship", "Ship_Source"]]
+        df_final = df_final[["Notes", "Source_Word_File", "Ship", "Commander", "Arrival_Port_City", "Ship_Source"]]
         df_final.to_excel(output_file, index=False)
         print(f"\nAnalysis complete. Found {len(missing_records)} records missing from the Master Excel.")
         print(f"Report saved as: {output_file}")
